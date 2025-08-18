@@ -1,42 +1,29 @@
-plugins {
-    id 'com.android.application'
-    id 'org.jetbrains.kotlin.android'
+plugins { id 'com.android.application' id 'org.jetbrains.kotlin.android' version '1.9.20' }
+
+android { namespace 'me.sharik.blockjr' compileSdk 34
+
+defaultConfig {
+    applicationId "me.sharik.blockjr"
+    minSdk 24
+    targetSdk 34
+    versionCode 1
+    versionName "1.0"
 }
 
-android {
-    namespace 'me.sharik.blockjr'
-    compileSdk 34
-
-    defaultConfig {
-        applicationId "me.sharik.blockjr"
-        minSdk 24
-        targetSdk 34
-        versionCode 1
-        versionName "1.0"
-    }
-
-    buildTypes {
-        release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-        }
-    }
-    compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
-    }
-    kotlinOptions {
-        jvmTarget = '1.8'
+buildTypes {
+    release {
+        minifyEnabled false
+        proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
     }
 }
-
-dependencies {
-    implementation 'androidx.core:core-ktx:1.12.0'
-    implementation 'androidx.appcompat:appcompat:1.6.1'
-    implementation 'com.google.android.material:material:1.9.0'
-    implementation project(':capacitor-android')
-    implementation project(':capacitor-cordova-android-plugins')
-    implementation project(':capacitor-device')
-    // Include capacitor-community-bluetooth-le only if needed
-    implementation project(':capacitor-community-bluetooth-le')
+compileOptions {
+    sourceCompatibility JavaVersion.VERSION_1_8
+    targetCompatibility JavaVersion.VERSION_1_8
 }
+kotlinOptions {
+    jvmTarget = '1.8'
+}
+
+}
+
+dependencies { implementation 'androidx.core:core-ktx:1.12.0' implementation 'androidx.appcompat:appcompat:1.6.1' implementation 'com.google.android.material:material:1.9.0' implementation project(':capacitor-android') implementation project(':capacitor-cordova-android-plugins') implementation project(':capacitor-device') implementation project(':capacitor-community-bluetooth-le') }
