@@ -92,7 +92,7 @@ def generate_project_file():
         # Backend & Core
         ".py", ".toml",
         # Config & Docs
-        ".md", ".txt", ".yml", ".yaml", ".xml", ".env"
+        ".md", ".txt", ".yml", ".yaml", ".xml", ".env", ".java", ".pro"
     ]
 
     print(f"🔍 Scanning project in '{os.path.abspath(project_dir)}'...")

@@ -1,6 +1,7 @@
 // src/utils/ensureBluetoothPermissions.ts
 import { Capacitor } from '@capacitor/core';
-import { BluetoothSerial } from '@e-is/capacitor-bluetooth-serial';
+
+const BluetoothSerial = Capacitor.registerPlugin('BluetoothSerial');
 
 const platform = Capacitor.getPlatform();
 const isNative = platform !== 'web';
@@ -14,6 +15,23 @@ export async function ensureBluetoothPermissions(): Promise<boolean> {
   if (!isNative) {
     console.log('[ensureBluetoothPermissions] Not native platform; skipping checks (web).');
     return true;
+  }
+
+  const perms = [
+    'android.permission.BLUETOOTH_CONNECT',
+    'android.permission.BLUETOOTH_SCAN',
+    'android.permission.ACCESS_FINE_LOCATION'
+  ];
+
+  for (const p of perms) {
+    let { granted } = await BluetoothSerial.checkPermission({ permission: p });
+    if (!granted) {
+      ({ granted } = await BluetoothSerial.requestPermission({ permission: p }));
+      if (!granted) {
+        console.warn(`[ensureBluetoothPermissions] Permission ${p} denied`);
+        return false;
+      }
+    }
   }
 
   // 1) Ensure Bluetooth is enabled

@@ -4,7 +4,7 @@ import { executeBlocks } from './utils/blockExecutor';
 import { useDragDrop } from './hooks/useDragDrop';
 import { Block } from './types/Block';
 import { BlockPalette } from './components/BlockPalette';
-import { BluetoothConnector } from './components/BluetoothConnector';
+import BluetoothConnector from './components/BluetoothConnector';
 import { Workspace } from './components/Workspace';
 import { ensureBluetoothPermissions } from './utils/ensureBluetoothPermissions';
 
