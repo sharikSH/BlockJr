@@ -1,5 +1,6 @@
 // src/utils/ensureBluetoothPermissions.ts
 import { Capacitor } from '@capacitor/core';
+import bluetoothService from './bluetoothService';
 
 const BluetoothSerial = Capacitor.registerPlugin('BluetoothSerial');
 
