@@ -1,5 +1,27 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        google()
+        mavenCentral()
+    }
+}
+
+dependencyResolutionManagement {
+    // Prefer settings.gradle repositories across all subprojects
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositories {
+        google()
+        mavenCentral()
+        // If you need extra repos (like Jitpack), add here:
+        // maven { url "https://jitpack.io" }
+    }
+}
+
+rootProject.name = "BlockJr"
+
 include ':app'
 include ':capacitor-cordova-android-plugins'
 project(':capacitor-cordova-android-plugins').projectDir = new File('./capacitor-cordova-android-plugins/')
 
+// Keep Capacitor’s own settings
 apply from: 'capacitor.settings.gradle'
