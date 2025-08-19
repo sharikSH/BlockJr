@@ -1,6 +1,5 @@
 // src/utils/ensureBluetoothPermissions.ts
 import { Capacitor } from '@capacitor/core';
-import bluetoothService from './bluetoothService';
 
 const BluetoothSerial = Capacitor.registerPlugin('BluetoothSerial');
 
@@ -10,7 +9,9 @@ const isNative = platform !== 'web';
 /**
  * Best-effort check for Bluetooth usage prerequisites.
  * Returns true when Bluetooth is enabled and necessary conditions are met.
- * Returns false when user action is required (e.g., enable Bluetooth).
+ * Returns false when user action is required (e.g., enable Bluetooth) OR plugin missing.
+ *
+ * Important: this function no longer throws on missing plugin; it returns false so UI can show friendly message.
  */
 export async function ensureBluetoothPermissions(): Promise<boolean> {
   if (!isNative) {
@@ -18,49 +19,64 @@ export async function ensureBluetoothPermissions(): Promise<boolean> {
     return true;
   }
 
-  const perms = [
-    'android.permission.BLUETOOTH_CONNECT',
-    'android.permission.BLUETOOTH_SCAN',
-    'android.permission.ACCESS_FINE_LOCATION'
-  ];
+  // Guard plugin calls so missing native implementation doesn't throw uncaught errors
+  try {
+    const perms = [
+      'android.permission.BLUETOOTH_CONNECT',
+      'android.permission.BLUETOOTH_SCAN',
+      'android.permission.ACCESS_FINE_LOCATION'
+    ];
 
-  for (const p of perms) {
-    let { granted } = await BluetoothSerial.checkPermission({ permission: p });
-    if (!granted) {
-      ({ granted } = await BluetoothSerial.requestPermission({ permission: p }));
-      if (!granted) {
-        console.warn(`[ensureBluetoothPermissions] Permission ${p} denied`);
+    // If checkPermission not available (plugin missing) this will throw — we catch below and return false.
+    for (const p of perms) {
+      try {
+        const chk = await BluetoothSerial.checkPermission({ permission: p }) as any;
+        let granted = Boolean(chk?.granted);
+        if (!granted) {
+          const rq = await BluetoothSerial.requestPermission({ permission: p }) as any;
+          granted = Boolean(rq?.granted);
+          if (!granted) {
+            console.warn(`[ensureBluetoothPermissions] Permission ${p} denied`);
+            return false;
+          }
+        }
+      } catch (e) {
+        console.warn('[ensureBluetoothPermissions] permission check/request failed (plugin may be missing)', e);
         return false;
       }
     }
-  }
 
-  // 1) Ensure Bluetooth is enabled
-  let bluetoothEnabled = false;
-  let retries = 3;
-  while (retries > 0) {
-    try {
-      const { enabled } = await BluetoothSerial.isEnabled();
-      bluetoothEnabled = enabled;
-      if (enabled) {
-        console.log('[ensureBluetoothPermissions] Bluetooth is enabled');
-        break;
+    // Ensure Bluetooth enabled — attempt enable (best-effort).
+    let bluetoothEnabled = false;
+    let retries = 3;
+    while (retries > 0) {
+      try {
+        const res = await BluetoothSerial.isEnabled() as any;
+        bluetoothEnabled = !!res?.enabled;
+        if (bluetoothEnabled) {
+          console.log('[ensureBluetoothPermissions] Bluetooth enabled');
+          break;
+        }
+        // try to enable
+        await BluetoothSerial.enable();
+        // small wait
+        await new Promise((r) => setTimeout(r, 1000));
+      } catch (e) {
+        console.warn('[ensureBluetoothPermissions] isEnabled/enable failed (plugin may be missing or user declined)', e);
+        // don't throw — break to allow returning false below
       }
-      console.log(`[ensureBluetoothPermissions] Bluetooth disabled, attempting to enable... (attempt ${4 - retries}/3)`);
-      await BluetoothSerial.enable();
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for enable to take effect
-    } catch (e) {
-      console.warn(`[ensureBluetoothPermissions] Bluetooth enable attempt failed (attempt ${4 - retries}/3)`, e);
+      retries--;
     }
-    retries--;
-  }
 
-  if (!bluetoothEnabled) {
-    console.warn('[ensureBluetoothPermissions] Bluetooth could not be enabled; user action required');
+    if (!bluetoothEnabled) {
+      console.warn('[ensureBluetoothPermissions] Bluetooth could not be enabled; user action required');
+      return false;
+    }
+
+    console.log('[ensureBluetoothPermissions] All checks passed');
+    return true;
+  } catch (e) {
+    console.warn('[ensureBluetoothPermissions] Unexpected error (treating as failure)', e);
     return false;
   }
-
-  // All checks passed (Bluetooth enabled)
-  console.log('[ensureBluetoothPermissions] All checks passed');
-  return true;
 }
