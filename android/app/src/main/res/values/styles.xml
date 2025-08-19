@@ -15,8 +15,14 @@
         <item name="android:background">@null</item>
     </style>
 
+    <!-- Missing splash screen theme (fixes build error) -->
+    <style name="Theme.SplashScreen" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <!-- Temporary white background (replace with your splash drawable if you want) -->
+        <item name="android:windowBackground">@android:color/white</item>
+    </style>
 
     <style name="AppTheme.NoActionBarLaunch" parent="Theme.SplashScreen">
         <item name="android:background">@drawable/splash</item>
     </style>
+
 </resources>
