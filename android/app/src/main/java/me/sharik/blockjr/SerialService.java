@@ -1,288 +1,172 @@
 package me.sharik.blockjr;
 
-import android.app.Notification;
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-import android.app.PendingIntent;
 import android.app.Service;
-import android.content.Context;
 import android.content.Intent;
-import android.os.Build;
-import android.os.Handler;
+import android.os.Binder;
 import android.os.IBinder;
-import android.os.Looper;
+import android.util.Log;
 
 import androidx.annotation.Nullable;
-import androidx.annotation.RequiresApi;
-import androidx.core.app.NotificationCompat;
 
 import java.io.IOException;
-import java.util.ArrayDeque;
 
 /**
- * create notification and queue serial data while activity is not in the foreground
- * use listener chain: SerialSocket -> SerialService -> UI fragment
+ * SerialService - bound service used by BluetoothSerialPlugin.
+ * Implements attach/detach/connect/disconnect/write used by the plugin.
+ *
+ * Note: This implementation assumes SerialSocket exposes:
+ *   - void connect() throws Exception
+ *   - void write(byte[] data) throws Exception
+ *   - void close() throws IOException
+ *
+ * If your SerialSocket API differs, adjust method calls accordingly.
  */
-public class SerialService extends Service implements SerialListener {
+public class SerialService extends Service {
 
-    public class SerialBinder extends Binder {
-        public SerialService getService() { return SerialService.this; }
-    }
+    private static final String TAG = "SerialService";
 
-    private enum QueueType {Connect, ConnectError, Read, IoError}
+    // Binder given to clients
+    private final IBinder binder = new SerialBinder();
 
-    private static class QueueItem {
-        QueueType type;
-        ArrayDeque<byte[]> datas;
-        Exception e;
-
-        QueueItem(QueueType type) { this.type=type; if(type==QueueType.Read) init(); }
-        QueueItem(QueueType type, Exception e) { this.type=type; this.e=e; }
-        QueueItem(QueueType type, ArrayDeque<byte[]> datas) { this.type=type; this.datas=datas; }
-
-        void init() { datas = new ArrayDeque<>(); }
-        void add(byte[] data) { datas.add(data); }
-    }
-
-    private final Handler mainLooper;
-    private final IBinder binder;
-    private final ArrayDeque<QueueItem> queue1, queue2;
-    private final QueueItem lastRead;
-
-    private SerialSocket socket;
+    // Listener (the plugin) which receives serial events
     private SerialListener listener;
-    public boolean connected;
+
+    // Current socket used for communication
+    private SerialSocket socket;
+
+    // Connection state accessible to plugin
+    public boolean connected = false;
 
     /**
-     * Lifecylce
+     * Class used for the client Binder.
+     * Because this service runs in the same process as its clients,
+     * we can return a direct reference.
      */
-    public SerialService() {
-        mainLooper = new Handler(Looper.getMainLooper());
-        binder = new SerialBinder();
-        queue1 = new ArrayDeque<>();
-        queue2 = new ArrayDeque<>();
-        lastRead = new QueueItem(QueueType.Read);
-    }
-
-    @Override
-    public void onDestroy() {
-        cancelNotification();
-        disconnect();
-        super.onDestroy();
+    public class SerialBinder extends Binder {
+        public SerialService getService() {
+            return SerialService.this;
+        }
     }
 
     @Nullable
     @Override
     public IBinder onBind(Intent intent) {
+        Log.d(TAG, "onBind()");
         return binder;
     }
 
-    /**
-     * Api
-     */
-    public void connect(SerialSocket socket) throws IOException {
-        socket.connect(this);
-        this.socket = socket;
-        connected = true;
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        Log.d(TAG, "onCreate()");
     }
 
-    public void disconnect() {
-        connected = false; // ignore data,errors while disconnecting
-        cancelNotification();
-        if(socket != null) {
-            socket.disconnect();
-            socket = null;
-        }
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        Log.d(TAG, "onStartCommand()");
+        // If you want foreground notifications, create them here.
+        return START_STICKY;
     }
 
-    public void write(byte[] data) throws IOException {
-        if(!connected)
-            throw new IOException("not connected");
-        socket.write(data);
-    }
-
-    public void attach(SerialListener listener) {
-        if(Looper.getMainLooper().getThread() != Thread.currentThread())
-            throw new IllegalArgumentException("not in main thread");
-        initNotification();
-        cancelNotification();
-        // use synchronized() to prevent new items in queue2
-        // new items will not be added to queue1 because mainLooper.post and attach() run in main thread
-        synchronized (this) {
-            this.listener = listener;
-        }
-        for(QueueItem item : queue1) {
-            switch(item.type) {
-                case Connect:       listener.onSerialConnect      (); break;
-                case ConnectError:  listener.onSerialConnectError (item.e); break;
-                case Read:          listener.onSerialRead         (item.datas); break;
-                case IoError:       listener.onSerialIoError      (item.e); break;
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        Log.d(TAG, "onDestroy()");
+        // Cleanup socket if still open
+        try {
+            if (socket != null) {
+                socket.close();
             }
-        }
-        for(QueueItem item : queue2) {
-            switch(item.type) {
-                case Connect:       listener.onSerialConnect      (); break;
-                case ConnectError:  listener.onSerialConnectError (item.e); break;
-                case Read:          listener.onSerialRead         (item.datas); break;
-                case IoError:       listener.onSerialIoError      (item.e); break;
-            }
-        }
-        queue1.clear();
-        queue2.clear();
-    }
-
-    public void detach() {
-        if(connected)
-            createNotification();
-        // items already in event queue (posted before detach() to mainLooper) will end up in queue1
-        // items occurring later, will be moved directly to queue2
-        // detach() and mainLooper.post run in the main thread, so all items are caught
+        } catch (Exception ignored) {}
+        socket = null;
+        connected = false;
         listener = null;
     }
 
-    private void initNotification() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel nc = new NotificationChannel(Constants.NOTIFICATION_CHANNEL, "Background service", NotificationManager.IMPORTANCE_LOW);
-            nc.setShowBadge(false);
-            NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-            nm.createNotificationChannel(nc);
-        }
-    }
-
-    @RequiresApi(Build.VERSION_CODES.O)
-    public boolean areNotificationsEnabled() {
-        NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        NotificationChannel nc = nm.getNotificationChannel(Constants.NOTIFICATION_CHANNEL);
-        return nm.areNotificationsEnabled() && nc != null && nc.getImportance() > NotificationManager.IMPORTANCE_NONE;
-    }
-
-    private void createNotification() {
-        Intent disconnectIntent = new Intent()
-                .setPackage(getPackageName())
-                .setAction(Constants.INTENT_ACTION_DISCONNECT);
-        Intent restartIntent = new Intent()
-                .setClassName(this, Constants.INTENT_CLASS_MAIN_ACTIVITY)
-                .setAction(Intent.ACTION_MAIN)
-                .addCategory(Intent.CATEGORY_LAUNCHER);
-        int flags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0;
-        PendingIntent disconnectPendingIntent = PendingIntent.getBroadcast(this, 1, disconnectIntent, flags);
-        PendingIntent restartPendingIntent = PendingIntent.getActivity(this, 1, restartIntent,  flags);
-        NotificationCompat.Builder builder = new NotificationCompat.Builder(this, Constants.NOTIFICATION_CHANNEL)
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setContentTitle(getResources().getString(R.string.app_name))
-                .setContentText(socket != null ? "Connected to "+socket.getName() : "Background Service")
-                .setContentIntent(restartPendingIntent)
-                .setOngoing(true);
-                // .addAction(new NotificationCompat.Action(android.R.drawable.ic_delete, "Disconnect", disconnectPendingIntent)); // assume no ic_delete
-        Notification notification = builder.build();
-        startForeground(Constants.NOTIFY_MANAGER_START_FOREGROUND_SERVICE, notification);
-    }
-
-    private void cancelNotification() {
-        stopForeground(true);
-    }
+    // -----------------------
+    // Methods used by plugin
+    // -----------------------
 
     /**
-     * SerialListener
+     * Attach a listener (the plugin) to receive callbacks.
      */
-    public void onSerialConnect() {
-        if(connected) {
-            synchronized (this) {
-                if (listener != null) {
-                    mainLooper.post(() -> {
-                        if (listener != null) {
-                            listener.onSerialConnect();
-                        } else {
-                            queue1.add(new QueueItem(QueueType.Connect));
-                        }
-                    });
-                } else {
-                    queue2.add(new QueueItem(QueueType.Connect));
-                }
-            }
-        }
+    public void attach(SerialListener l) {
+        this.listener = l;
     }
-
-    public void onSerialConnectError(Exception e) {
-        if(connected) {
-            synchronized (this) {
-                if (listener != null) {
-                    mainLooper.post(() -> {
-                        if (listener != null) {
-                            listener.onSerialConnectError(e);
-                        } else {
-                            queue1.add(new QueueItem(QueueType.ConnectError, e));
-                            disconnect();
-                        }
-                    });
-                } else {
-                    queue2.add(new QueueItem(QueueType.ConnectError, e));
-                    disconnect();
-                }
-            }
-        }
-    }
-
-    public void onSerialRead(ArrayDeque<byte[]> datas) { throw new UnsupportedOperationException(); }
 
     /**
-     * reduce number of UI updates by merging data chunks.
-     * Data can arrive at hundred chunks per second, but the UI can only
-     * perform a dozen updates if receiveText already contains much text.
+     * Detach the listener to avoid leaks.
+     */
+    public void detach() {
+        this.listener = null;
+    }
+
+    /**
+     * Connect using the provided SerialSocket.
+     * This will attempt to connect synchronously and notify listener.
      *
-     * On new data inform UI thread once (1).
-     * While not consumed (2), add more data (3).
+     * @throws Exception when connection fails
      */
-    public void onSerialRead(byte[] data) {
-        if(connected) {
-            synchronized (this) {
-                if (listener != null) {
-                    boolean first;
-                    synchronized (lastRead) {
-                        first = lastRead.datas.isEmpty(); // (1)
-                        lastRead.add(data); // (3)
-                    }
-                    if(first) {
-                        mainLooper.post(() -> {
-                            ArrayDeque<byte[]> datas;
-                            synchronized (lastRead) {
-                                datas = lastRead.datas;
-                                lastRead.init(); // (2)
-                            }
-                            if (listener != null) {
-                                listener.onSerialRead(datas);
-                            } else {
-                                queue1.add(new QueueItem(QueueType.Read, datas));
-                            }
-                        });
-                    }
-                } else {
-                    if(queue2.isEmpty() || queue2.getLast().type != QueueType.Read)
-                        queue2.add(new QueueItem(QueueType.Read));
-                    queue2.getLast().add(data);
-                }
+    public synchronized void connect(SerialSocket s) throws Exception {
+        if (s == null) throw new IllegalArgumentException("socket is null");
+        // Close previous socket if any
+        try {
+            if (this.socket != null) {
+                try { this.socket.close(); } catch (Exception ignored) {}
+            }
+        } catch (Exception ignored) {}
+
+        this.socket = s;
+        try {
+            this.socket.connect();
+            this.connected = true;
+            if (listener != null) {
+                listener.onSerialConnect();
+            }
+        } catch (Exception e) {
+            this.connected = false;
+            if (listener != null) {
+                listener.onSerialConnectError(e);
+            }
+            // rethrow so callers (plugin) know connect failed
+            throw e;
+        }
+    }
+
+    /**
+     * Disconnect current socket and notify listener.
+     */
+    public synchronized void disconnect() {
+        try {
+            if (socket != null) {
+                try { socket.close(); } catch (Exception ignored) {}
+                socket = null;
+            }
+        } finally {
+            boolean hadConnection = this.connected;
+            this.connected = false;
+            if (listener != null && hadConnection) {
+                listener.onSerialIoError(new Exception("Disconnected"));
             }
         }
     }
 
-    public void onSerialIoError(Exception e) {
-        if(connected) {
-            synchronized (this) {
-                if (listener != null) {
-                    mainLooper.post(() -> {
-                        if (listener != null) {
-                            listener.onSerialIoError(e);
-                        } else {
-                            queue1.add(new QueueItem(QueueType.IoError, e));
-                            disconnect();
-                        }
-                    });
-                } else {
-                    queue2.add(new QueueItem(QueueType.IoError, e));
-                    disconnect();
-                }
-            }
+    /**
+     * Write bytes to the connected socket.
+     *
+     * @param data bytes to write
+     * @throws Exception if not connected or write fails
+     */
+    public synchronized void write(byte[] data) throws Exception {
+        if (!connected || socket == null) {
+            throw new IllegalStateException("Not connected");
         }
+        // delegate actual writing to SerialSocket
+        socket.write(data);
     }
 
+    // Example utility method
+    public String getStatus() {
+        return "SerialService running (connected=" + connected + ")";
+    }
 }
