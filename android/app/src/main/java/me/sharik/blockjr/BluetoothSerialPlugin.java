@@ -1,5 +1,5 @@
 // android/app/src/main/java/<your_package>/BluetoothSerialPlugin.java
-package com.example.myapp; // <-- REPLACE with your package name
+package me.sharik.blockjr; // <-- REPLACE with your package name
 
 import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
