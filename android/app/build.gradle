@@ -1,4 +1,7 @@
-plugins { id 'com.android.application' id 'org.jetbrains.kotlin.android' version '1.9.20' }
+plugins { 
+    id 'com.android.application' 
+    id 'org.jetbrains.kotlin.android'
+}
 
 android { namespace 'me.sharik.blockjr' compileSdk 34
 
