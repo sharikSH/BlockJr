@@ -1,403 +1,319 @@
-package me.sharik.blockjr;
+// android/app/src/main/java/<your_package>/BluetoothSerialPlugin.java
+package com.example.myapp; // <-- REPLACE with your package name
+
+import android.app.Activity;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothSocket;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.util.Log;
 
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
-import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
+import com.getcapacitor.annotation.PluginMethod;
 
-import android.Manifest;
-import android.bluetooth.BluetoothAdapter;
-import android.bluetooth.BluetoothDevice;
-import android.content.BroadcastReceiver;
-import android.content.ComponentName;
-import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.content.ServiceConnection;
-import android.content.pm.PackageManager;
-import android.os.IBinder;
-import android.util.Log;
-
-import androidx.core.app.ActivityCompat;
-
-import java.io.UnsupportedEncodingException;
-import java.util.ArrayDeque;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.util.ArrayList;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Full plugin implementation; only change relative to your original:
- *  - enable() now starts the system enable Intent via a valid Context,
- *    adding FLAG_ACTIVITY_NEW_TASK so it works from plugin/service context.
+ * Minimal Capacitor plugin wrapper around Android Bluetooth APIs.
  *
- * All other methods/logic preserved from the original file you provided.
+ * Exposes methods:
+ * - isEnabled() -> { enabled: boolean }
+ * - enable() -> { enabled: boolean } (fires an ACTION_REQUEST_ENABLE intent)
+ * - scan() -> { devices: [ { id, name } ] }  (performs discovery and resolves when discovery finishes or timeout)
+ * - connect({ address }) -> resolves true/false
+ * - disconnect() -> resolves
+ * - write({ value }) -> resolves
+ *
+ * Emits events with notifyListeners:
+ * - "data" -> { value: "..." }
+ * - "disconnect" -> {}
+ * - "enabledChange" -> { enabled: boolean }
+ *
+ * NOTE: This is a minimal, pragmatic implementation intended to work with the existing JS UI.
+ * It uses RFCOMM SPP UUID for connect. If you have a different socket abstraction in SimpleBluetoothTerminal,
+ * you can replace the connect/read logic with the project's SerialSocket classes.
  */
-@CapacitorPlugin(
-        name = "BluetoothSerial",
-        permissions = {
-                @Permission(strings = {Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.ACCESS_FINE_LOCATION}, alias = "bluetooth")
-        }
-)
-public class BluetoothSerialPlugin extends Plugin implements SerialListener {
+@CapacitorPlugin(name = "BluetoothSerial")
+public class BluetoothSerialPlugin extends Plugin {
 
-    private static final String TAG = "BluetoothSerial";
+    private static final String TAG = "BluetoothSerialPlugin";
+    private final BluetoothAdapter btAdapter = BluetoothAdapter.getDefaultAdapter();
 
-    private BluetoothAdapter bluetoothAdapter;
-    private ArrayList<BluetoothDevice> discoveredDevices = new ArrayList<>();
+    // Discovery
+    private final ArrayList<JSObject> discoveredDevices = new ArrayList<>();
     private BroadcastReceiver discoveryReceiver;
-    private SerialService service;
-    private boolean isServiceBound = false;
-    private ServiceConnection serviceConnection = new ServiceConnection() {
-        @Override
-        public void onServiceConnected(ComponentName name, IBinder binder) {
-            service = ((SerialService.SerialBinder) binder).getService();
-            isServiceBound = true;
-            service.attach(BluetoothSerialPlugin.this);
-            tryConnect();
-        }
+    private final AtomicBoolean discoveryInProgress = new AtomicBoolean(false);
 
-        @Override
-        public void onServiceDisconnected(ComponentName name) {
-            service = null;
-            isServiceBound = false;
-        }
-    };
-    private PluginCall pendingConnectCall;
-    private SerialSocket pendingSocket;
-    private BroadcastReceiver stateReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
-            int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
-            JSObject ret = new JSObject();
-            ret.put("enabled", state == BluetoothAdapter.STATE_ON);
-            notifyListeners("enabledChange", ret);
-        }
-    };
+    // Connection
+    private BluetoothSocket socket = null;
+    private BluetoothDevice connectedDevice = null;
+    private Thread readThread = null;
+    private final UUID SPP_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
 
     @Override
     public void load() {
-        bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
-        // register state change receiver
-        Context ctx = getContext();
-        if (ctx != null) {
-            ctx.registerReceiver(stateReceiver, new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED));
-        } else {
-            // fallback to activity if context null (unlikely)
-            getActivity().registerReceiver(stateReceiver, new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED));
-        }
+        Log.d(TAG, "plugin loaded");
+        // listen for adapter state changes
+        IntentFilter f = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
+        getContext().registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                final int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1);
+                boolean enabled = state == BluetoothAdapter.STATE_ON;
+                notifyEnabledChange(enabled);
+            }
+        }, f);
     }
 
-    @Override
-    protected void handleOnDestroy() {
-        Context ctx = getContext();
-        try {
-            if (ctx != null) {
-                ctx.unregisterReceiver(stateReceiver);
-            } else {
-                try { getActivity().unregisterReceiver(stateReceiver); } catch (Exception ignored) {}
-            }
-        } catch (Exception ignored) {}
-        if (isServiceBound) {
-            if (service != null) {
-                service.detach();
-            }
-            Context c = getContext();
-            if (c != null) {
-                c.unbindService(serviceConnection);
-            } else {
-                try { getActivity().unbindService(serviceConnection); } catch (Exception ignored) {}
-            }
-            isServiceBound = false;
-        }
-        super.handleOnDestroy();
+    private void notifyEnabledChange(boolean enabled) {
+        JSObject o = new JSObject();
+        o.put("enabled", enabled);
+        notifyListeners("enabledChange", o);
     }
 
     @PluginMethod
     public void isEnabled(PluginCall call) {
-        if (bluetoothAdapter == null) {
-            call.reject("Bluetooth not supported");
-            return;
-        }
+        boolean enabled = (btAdapter != null && btAdapter.isEnabled());
         JSObject ret = new JSObject();
-        ret.put("enabled", bluetoothAdapter.isEnabled());
+        ret.put("enabled", enabled);
         call.resolve(ret);
     }
 
     @PluginMethod
     public void enable(PluginCall call) {
-        if (bluetoothAdapter == null) {
-            call.reject("Bluetooth not supported");
+        if (btAdapter == null) {
+            call.reject("Bluetooth adapter not available");
             return;
         }
-        if (!bluetoothAdapter.isEnabled()) {
-            Intent enableIntent = new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE);
-
-            // start via a valid Context (plugin may not have direct startActivity method)
-            Context ctx = getContext();
-            if (ctx == null) {
-                ctx = getActivity();
-            }
-            if (ctx == null) {
-                call.reject("No context available to start activity");
-                return;
-            }
-
-            // When starting an Activity from a non-Activity context add NEW_TASK flag
-            enableIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            ctx.startActivity(enableIntent);
+        Activity activity = getActivity();
+        Intent enableIntent = new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE);
+        try {
+            // Start the standard activity to request enabling Bluetooth.
+            // This returns immediately; the user may still need to accept.
+            activity.startActivity(enableIntent);
+            JSObject ret = new JSObject();
+            ret.put("enabled", btAdapter.isEnabled());
+            call.resolve(ret);
+        } catch (Exception e) {
+            Log.w(TAG, "enable request failed", e);
+            call.reject("enable failed", e);
         }
-        call.resolve();
     }
 
     @PluginMethod
-    public void scan(PluginCall call) {
-        if (bluetoothAdapter == null) {
-            call.reject("Bluetooth not supported");
+    public void scan(final PluginCall call) {
+        if (btAdapter == null) {
+            call.reject("Bluetooth adapter not available");
             return;
         }
-        if (!bluetoothAdapter.isEnabled()) {
-            call.reject("Bluetooth disabled");
+
+        // If discovery already running, return early with current discovered devices
+        if (discoveryInProgress.get()) {
+            JSObject out = new JSObject();
+            out.put("devices", new JSArray(discoveredDevices));
+            call.resolve(out);
             return;
         }
-        if (bluetoothAdapter.isDiscovering()) {
-            bluetoothAdapter.cancelDiscovery();
-        }
+
         discoveredDevices.clear();
+
         discoveryReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                String action = intent.getAction();
+                final String action = intent.getAction();
                 if (BluetoothDevice.ACTION_FOUND.equals(action)) {
                     BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
-                    if (device != null && device.getType() != BluetoothDevice.DEVICE_TYPE_LE && !containsDevice(device)) {
-                        discoveredDevices.add(device);
-                    }
+                    JSObject d = new JSObject();
+                    d.put("id", device.getAddress());
+                    d.put("name", device.getName() != null ? device.getName() : "Unknown");
+                    discoveredDevices.add(d);
                 } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(action)) {
-                    JSArray devicesArray = new JSArray();
-                    for (BluetoothDevice d : discoveredDevices) {
-                        JSObject o = new JSObject();
-                        o.put("id", d.getAddress());
-                        o.put("name", d.getName());
-                        devicesArray.put(o);
-                    }
-                    JSObject result = new JSObject();
-                    result.put("devices", devicesArray);
-                    call.resolve(result);
-                    try {
-                        context.unregisterReceiver(this);
-                    } catch (Exception ignored) {
-                    }
-                    discoveryReceiver = null;
+                    // done
+                    getContext().unregisterReceiver(this);
+                    discoveryInProgress.set(false);
+                    JSObject out = new JSObject();
+                    out.put("devices", new JSArray(discoveredDevices));
+                    call.resolve(out);
                 }
-            }
-
-            private boolean containsDevice(BluetoothDevice device) {
-                for (BluetoothDevice d : discoveredDevices) {
-                    if (d.getAddress().equals(device.getAddress())) {
-                        return true;
-                    }
-                }
-                return false;
             }
         };
-        IntentFilter filter = new IntentFilter(BluetoothDevice.ACTION_FOUND);
+
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(BluetoothDevice.ACTION_FOUND);
         filter.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
-        Context ctx = getContext();
-        if (ctx == null) ctx = getActivity();
-        if (ctx != null) ctx.registerReceiver(discoveryReceiver, filter);
-        boolean started = bluetoothAdapter.startDiscovery();
+
+        try {
+            getContext().registerReceiver(discoveryReceiver, filter);
+        } catch (Exception e) {
+            Log.w(TAG, "registerReceiver failed", e);
+            // still attempt scan but without receiver (shouldn't happen)
+        }
+
+        boolean started = btAdapter.startDiscovery();
+        discoveryInProgress.set(started);
         if (!started) {
-            call.reject("Failed to start discovery");
-            if (discoveryReceiver != null) {
-                try {
-                    ctx.unregisterReceiver(discoveryReceiver);
-                } catch (Exception ignored) {
+            // If discovery failed to start, cleanup and reject
+            try {
+                getContext().unregisterReceiver(discoveryReceiver);
+            } catch (Exception ignored) {}
+            discoveryInProgress.set(false);
+            call.reject("startDiscovery failed");
+        } else {
+            // discovery will resolve the call when ACTION_DISCOVERY_FINISHED fires
+            // as a safety timeout, also schedule a fallback resolution after 8s
+            // to avoid never resolving on some devices
+            final PluginCall pending = call;
+            getBridge().getActivity().getWindow().getDecorView().postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (discoveryInProgress.get()) {
+                        try {
+                            btAdapter.cancelDiscovery();
+                        } catch (Exception ignored) {}
+                        try {
+                            getContext().unregisterReceiver(discoveryReceiver);
+                        } catch (Exception ignored) {}
+                        discoveryInProgress.set(false);
+                        JSObject out = new JSObject();
+                        out.put("devices", new JSArray(discoveredDevices));
+                        if (pending != null && !pending.isReleased()) {
+                            pending.resolve(out);
+                        }
+                    }
                 }
-                discoveryReceiver = null;
-            }
+            }, 8000);
         }
     }
 
     @PluginMethod
-    public void connect(PluginCall call) {
+    public void connect(final PluginCall call) {
         String address = call.getString("address");
         if (address == null) {
-            call.reject("No address");
+            call.reject("address is required");
             return;
         }
-        if (bluetoothAdapter == null) {
-            call.reject("Bluetooth not supported");
+        if (btAdapter == null) {
+            call.reject("Bluetooth adapter not available");
             return;
         }
-        BluetoothDevice device = bluetoothAdapter.getRemoteDevice(address);
-        if (device == null) {
-            call.reject("Device not found");
-            return;
-        }
-        pendingConnectCall = call;
-        pendingSocket = new SerialSocket(getContext(), device);
-        Intent intent = new Intent(getContext(), SerialService.class);
-        Context ctx = getContext();
-        if (ctx == null) ctx = getActivity();
-        if (ctx == null) {
-            call.reject("No context to start service");
-            return;
-        }
-        // start as foreground service if available
-        try {
-            ctx.startForegroundService(intent);
-        } catch (Exception e) {
-            // fallback to startService for older devices or if not allowed
-            try { ctx.startService(intent); } catch (Exception ignored) {}
-        }
-        ctx.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE);
-    }
 
-    private void tryConnect() {
-        if (pendingSocket == null || pendingConnectCall == null || service == null) return;
-        try {
-            service.connect(pendingSocket);
-            // on success, plugin will receive onSerialConnect callback -> resolves pendingConnectCall there
-            // clear pending socket here to avoid duplicate attempts
-            pendingSocket = null;
-        } catch (Exception e) {
-            onSerialConnectError(e);
-        }
+        // stop discovery while connecting
+        try { btAdapter.cancelDiscovery(); } catch (Exception ignored) {}
+
+        final BluetoothDevice device = btAdapter.getRemoteDevice(address);
+        final JSObject res = new JSObject();
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    // create rfcomm socket and connect
+                    socket = device.createRfcommSocketToServiceRecord(SPP_UUID);
+                    socket.connect();
+                    connectedDevice = device;
+
+                    // start reader thread
+                    startReadThread();
+
+                    res.put("connected", true);
+                    call.resolve(res);
+                } catch (IOException e) {
+                    Log.e(TAG, "connect failed", e);
+                    res.put("connected", false);
+                    call.resolve(res);
+                    try {
+                        if (socket != null) {
+                            socket.close();
+                        }
+                    } catch (Exception ignored) {}
+                    socket = null;
+                }
+            }
+        }).start();
     }
 
     @PluginMethod
     public void disconnect(PluginCall call) {
-        if (service != null) {
-            service.disconnect();
-        }
-        if (isServiceBound) {
-            Context ctx = getContext();
-            if (ctx == null) ctx = getActivity();
-            if (ctx != null) {
-                try { ctx.unbindService(serviceConnection); } catch (Exception ignored) {}
+        try {
+            stopReadThread();
+            if (socket != null) {
+                socket.close();
+                socket = null;
             }
-            isServiceBound = false;
-        }
-        Intent intent = new Intent(getContext(), SerialService.class);
-        Context ctx = getContext();
-        if (ctx == null) ctx = getActivity();
-        if (ctx != null) {
-            try { ctx.stopService(intent); } catch (Exception ignored) {}
-        }
-        if (call != null) {
+            connectedDevice = null;
+            notifyListeners("disconnect", new JSObject());
             call.resolve();
+        } catch (Exception e) {
+            call.reject("disconnect failed", e);
         }
-    }
-
-    @PluginMethod
-    public void isConnected(PluginCall call) {
-        boolean conn = service != null && service.connected;
-        JSObject ret = new JSObject();
-        ret.put("connected", conn);
-        call.resolve(ret);
     }
 
     @PluginMethod
     public void write(PluginCall call) {
-        String value = call.getString("value");
-        if (value == null) {
-            call.reject("No value");
-            return;
-        }
-        if (service == null || !service.connected) {
+        String value = call.getString("value", "");
+        if (socket == null || !socket.isConnected()) {
             call.reject("Not connected");
             return;
         }
         try {
-            service.write((value + "\n").getBytes("UTF-8"));
+            OutputStream out = socket.getOutputStream();
+            out.write(value.getBytes());
+            out.flush();
             call.resolve();
-        } catch (Exception e) {
-            call.reject(e.getMessage());
+        } catch (IOException e) {
+            call.reject("write failed", e);
         }
     }
 
-    @PluginMethod
-    public void checkPermission(PluginCall call) {
-        String perm = call.getString("permission");
-        if (perm == null) {
-            call.reject("No permission");
-            return;
+    private void startReadThread() {
+        stopReadThread();
+        readThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    InputStream in = socket.getInputStream();
+                    byte[] buffer = new byte[1024];
+                    int len;
+                    while (socket != null && socket.isConnected() && (len = in.read(buffer)) > 0) {
+                        final String data = new String(buffer, 0, len, "UTF-8");
+                        JSObject o = new JSObject();
+                        o.put("value", data);
+                        notifyListeners("data", o);
+                    }
+                } catch (IOException e) {
+                    Log.i(TAG, "read thread ended", e);
+                } finally {
+                    try {
+                        if (socket != null) socket.close();
+                    } catch (IOException ignored) {}
+                    socket = null;
+                    connectedDevice = null;
+                    notifyListeners("disconnect", new JSObject());
+                }
+            }
+        });
+        readThread.start();
+    }
+
+    private void stopReadThread() {
+        if (readThread != null && readThread.isAlive()) {
+            try { readThread.interrupt(); } catch (Exception ignored) {}
+            readThread = null;
         }
-        int res = getContext().checkSelfPermission(perm);
-        JSObject ret = new JSObject();
-        ret.put("granted", res == PackageManager.PERMISSION_GRANTED);
-        call.resolve(ret);
-    }
-
-    @PluginMethod
-    public void requestPermission(PluginCall call) {
-        String perm = call.getString("permission");
-        if (perm == null) {
-            call.reject("No permission");
-            return;
-        }
-        saveCall(call);
-        ActivityCompat.requestPermissions(getActivity(), new String[]{perm}, 1);
-    }
-
-    @Override
-    public void handleRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        super.handleRequestPermissionsResult(requestCode, permissions, grantResults);
-        PluginCall savedCall = getSavedCall();
-        if (savedCall == null) return;
-        if (grantResults.length > 0) {
-            boolean granted = grantResults[0] == PackageManager.PERMISSION_GRANTED;
-            JSObject ret = new JSObject();
-            ret.put("granted", granted);
-            savedCall.resolve(ret);
-        } else {
-            savedCall.reject("Permission denied");
-        }
-    }
-
-    @Override
-    public void onSerialConnect() {
-        if (pendingConnectCall != null) {
-            pendingConnectCall.resolve();
-            pendingConnectCall = null;
-        }
-    }
-
-    @Override
-    public void onSerialConnectError(Exception e) {
-        JSObject ret = new JSObject();
-        ret.put("error", e.getMessage());
-        notifyListeners("connectError", ret);
-        if (pendingConnectCall != null) {
-            pendingConnectCall.reject(e.getMessage());
-            pendingConnectCall = null;
-        }
-        disconnect(null);
-    }
-
-    @Override
-    public void onSerialRead(byte[] data) {
-        try {
-            String s = new String(data, "UTF-8");
-            JSObject ret = new JSObject();
-            ret.put("value", s);
-            notifyListeners("data", ret);
-        } catch (UnsupportedEncodingException ignored) {
-        }
-    }
-
-    @Override
-    public void onSerialRead(ArrayDeque<byte[]> datas) {
-        // not used
-    }
-
-    @Override
-    public void onSerialIoError(Exception e) {
-        JSObject ret = new JSObject();
-        ret.put("error", e.getMessage());
-        notifyListeners("disconnect", ret);
-        disconnect(null);
     }
 }
